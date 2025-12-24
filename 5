@@ -1,0 +1,817 @@
+task.spawn(
+    function()
+        print("Pet Spawner script starting...")
+        
+        -- Load required modules
+        local success, modules = pcall(function()
+            local load = require(game.ReplicatedStorage:WaitForChild("Fsys")).load
+            
+            set_thread_identity(2)
+            local clientData = load("ClientData")
+            local items = load("KindDB")
+            local router = load("RouterClient")
+            local downloader = load("DownloadClient")
+            local animationManager = load("AnimationManager")
+            local petRigs = load("new:PetRigs")
+            set_thread_identity(8)
+
+            return {
+                clientData = clientData,
+                items = items,
+                router = router,
+                downloader = downloader,
+                animationManager = animationManager,
+                petRigs = petRigs
+            }
+        end)
+        
+        if not success then
+            warn("Failed to load modules:", modules)
+            return
+        end
+        
+        local clientData = modules.clientData
+        local items = modules.items
+        local router = modules.router
+        local downloader = modules.downloader
+        local animationManager = modules.animationManager
+        local petRigs = modules.petRigs
+
+        -- Initialize pet storage
+        local petModels = {}
+        local pets = {}
+        local equippedPet = nil
+        local mountedPet = nil
+        local currentMountTrack = nil
+
+        -- Helper function to update client data
+        local function updateData(key, action)
+            local data = clientData.get(key)
+            local clonedData = table.clone(data)
+            clientData.predict(key, action(clonedData))
+        end
+
+        -- Generate unique ID for pets
+        local function getUniqueId()
+            local HttpService = game:GetService("HttpService")
+            return HttpService:GenerateGUID(false)
+        end
+
+        -- Get pet model from cache or download
+        local function getPetModel(kind)
+            if petModels[kind] then
+                return petModels[kind]
+            end
+            local streamed = downloader.promise_download_copy("Pets", kind):expect()
+            petModels[kind] = streamed
+            return streamed
+        end
+
+        -- Core pet creation function - FIXED TO INCLUDE CORRECT PROPERTIES
+        local function createPet(id, properties)
+            local uniqueId = getUniqueId()
+            local pet = nil
+
+            set_thread_identity(2)
+            updateData(
+                "inventory",
+                function(inventory)
+                    local newPets = table.clone(inventory.pets)
+                    local item = items[id]
+                    pet = {
+                        unique = uniqueId,
+                        category = "pets",
+                        id = id,
+                        kind = item.kind,
+                        newness_order = 0,
+                        properties = properties
+                    }
+                    newPets[uniqueId] = pet
+                    inventory.pets = newPets
+                    return inventory
+                end
+            )
+
+            set_thread_identity(8)
+            pets[uniqueId] = {data = pet, model = nil}
+            return pet
+        end
+
+        -- Apply neon/mega neon effects
+        local function neonify(model, entry)
+            local petModel = model:FindFirstChild("PetModel")
+            if not petModel then
+                return
+            end
+            if entry.neon_parts then
+                for neonPart, configuration in pairs(entry.neon_parts) do
+                    local trueNeonPart = petRigs.get(petModel).get_geo_part(petModel, neonPart)
+                    if trueNeonPart then
+                        trueNeonPart.Material = configuration.Material
+                        trueNeonPart.Color = configuration.Color
+                    end
+                end
+            end
+        end
+
+        -- Add pet wrapper to client data
+        local function addPetWrapper(wrapper)
+            updateData(
+                "pet_char_wrappers",
+                function(petWrappers)
+                    wrapper.unique = #petWrappers + 1
+                    wrapper.index = #petWrappers + 1
+                    petWrappers[#petWrappers + 1] = wrapper
+                    return petWrappers
+                end
+            )
+        end
+
+        -- Add pet state manager
+        local function addPetState(state)
+            updateData(
+                "pet_state_managers",
+                function(petStates)
+                    petStates[#petStates + 1] = state
+                    return petStates
+                end
+            )
+        end
+
+        -- Find index in array
+        local function findIndex(array, finder)
+            for index, value in pairs(array) do
+                if finder(value, index) then
+                    return index
+                end
+            end
+            return nil
+        end
+
+        -- Remove pet wrapper
+        local function removePetWrapper(uniqueId)
+            updateData(
+                "pet_char_wrappers",
+                function(petWrappers)
+                    local index =
+                        findIndex(
+                        petWrappers,
+                        function(wrapper)
+                            return wrapper.pet_unique == uniqueId
+                        end
+                    )
+                    if not index then
+                        return petWrappers
+                    end
+                    table.remove(petWrappers, index)
+                    for wrapperIndex, wrapper in pairs(petWrappers) do
+                        wrapper.unique = wrapperIndex
+                        wrapper.index = wrapperIndex
+                    end
+                    return petWrappers
+                end
+            )
+        end
+
+        -- Clear pet state
+        local function clearPetState(uniqueId)
+            local pet = pets[uniqueId]
+            if not pet or not pet.model then
+                return
+            end
+            updateData(
+                "pet_state_managers",
+                function(states)
+                    local index =
+                        findIndex(
+                        states,
+                        function(state)
+                            return state.char == pet.model
+                        end
+                    )
+                    if not index then
+                        return states
+                    end
+                    local clonedStates = table.clone(states)
+                    clonedStates[index] = table.clone(clonedStates[index])
+                    clonedStates[index].states = {}
+                    return clonedStates
+                end
+            )
+        end
+
+        -- Set pet state
+        local function setPetState(uniqueId, id)
+            local pet = pets[uniqueId]
+            if not pet or not pet.model then
+                return
+            end
+            updateData(
+                "pet_state_managers",
+                function(states)
+                    local index =
+                        findIndex(
+                        states,
+                        function(state)
+                            return state.char == pet.model
+                        end
+                    )
+                    if not index then
+                        return states
+                    end
+                    local clonedStates = table.clone(states)
+                    clonedStates[index] = table.clone(clonedStates[index])
+                    clonedStates[index].states = {{id = id}}
+                    return clonedStates
+                end
+            )
+        end
+
+        -- Attach player to pet for riding
+        local function attachPlayerToPet(pet)
+            local character = game.Players.LocalPlayer.Character
+            if not character or not character.PrimaryPart then
+                return false
+            end
+            local ridePosition = pet:FindFirstChild("RidePosition", true)
+            if not ridePosition then
+                return false
+            end
+
+            local sourceAttachment = Instance.new("Attachment")
+            sourceAttachment.Parent = ridePosition
+            sourceAttachment.Position = Vector3.new(0, 1.237, 0)
+            sourceAttachment.Name = "SourceAttachment"
+
+            local stateConnection = Instance.new("RigidConstraint")
+            stateConnection.Name = "StateConnection"
+            stateConnection.Attachment0 = sourceAttachment
+            stateConnection.Attachment1 = character.PrimaryPart.RootAttachment
+            stateConnection.Parent = character
+            return true
+        end
+
+        -- Clear player state
+        local function clearPlayerState()
+            updateData(
+                "state_manager",
+                function(state)
+                    local clonedState = table.clone(state)
+                    clonedState.states = {}
+                    clonedState.is_sitting = false
+                    return clonedState
+                end
+            )
+        end
+
+        -- Set player state
+        local function setPlayerState(id)
+            updateData(
+                "state_manager",
+                function(state)
+                    local clonedState = table.clone(state)
+                    clonedState.states = {{id = id}}
+                    clonedState.is_sitting = true
+                    return clonedState
+                end
+            )
+        end
+
+        -- Remove pet state manager
+        local function removePetState(uniqueId)
+            local pet = pets[uniqueId]
+            if not pet or not pet.model then
+                return
+            end
+            updateData(
+                "pet_state_managers",
+                function(petStates)
+                    local index =
+                        findIndex(
+                        petStates,
+                        function(state)
+                            return state.char == pet.model
+                        end
+                    )
+                    if not index then
+                        return petStates
+                    end
+                    table.remove(petStates, index)
+                    return petStates
+                end
+            )
+        end
+
+        -- Unmount from pet
+        local function unmount(uniqueId)
+            local pet = pets[uniqueId]
+            if not pet or not pet.model then
+                return
+            end
+            if currentMountTrack then
+                currentMountTrack:Stop()
+                currentMountTrack:Destroy()
+            end
+            local sourceAttachment = pet.model:FindFirstChild("SourceAttachment", true)
+            if sourceAttachment then
+                sourceAttachment:Destroy()
+            end
+            if game.Players.LocalPlayer.Character then
+                for _, d in pairs(game.Players.LocalPlayer.Character:GetDescendants()) do
+                    if d:IsA("BasePart") and d:GetAttribute("HaveMass") then
+                        d.Massless = false
+                    end
+                end
+            end
+            clearPetState(uniqueId)
+            clearPlayerState()
+            pet.model:ScaleTo(1)
+            mountedPet = nil
+        end
+
+        -- Mount pet
+        local function mount(uniqueId, playerState, petState)
+            local pet = pets[uniqueId]
+            if not pet or not pet.model then
+                return
+            end
+            local player = game.Players.LocalPlayer
+            if not player.Character or not player.Character.PrimaryPart then
+                return
+            end
+            mountedPet = uniqueId
+            setPetState(uniqueId, petState)
+            setPlayerState(playerState)
+            pet.model:ScaleTo(2)
+            attachPlayerToPet(pet.model)
+            currentMountTrack =
+                player.Character.Humanoid.Animator:LoadAnimation(animationManager.get_track("PlayerRidingPet"))
+            player.Character.Humanoid.Sit = true
+            for _, d in pairs(player.Character:GetDescendants()) do
+                if d:IsA("BasePart") and d.Massless == false then
+                    d.Massless = true
+                    d:SetAttribute("HaveMass", true)
+                end
+            end
+            currentMountTrack:Play()
+        end
+
+        -- Fly on pet
+        local function fly(uniqueId)
+            mount(uniqueId, "PlayerFlyingPet", "PetBeingFlown")
+        end
+
+        -- Ride pet
+        local function ride(uniqueId)
+            mount(uniqueId, "PlayerRidingPet", "PetBeingRidden")
+        end
+
+        -- Unequip pet
+        local function unequip(item)
+            local pet = pets[item.unique]
+            if not pet or not pet.model then
+                return
+            end
+            unmount(item.unique)
+            removePetWrapper(item.unique)
+            removePetState(item.unique)
+            pet.model:Destroy()
+            pet.model = nil
+            equippedPet = nil
+        end
+
+        -- Equip pet
+        local function equip(item)
+            if equippedPet then
+                unequip(equippedPet)
+            end
+            local petModel = getPetModel(item.kind):Clone()
+            petModel.Parent = workspace
+            pets[item.unique].model = petModel
+            
+            -- Apply neon/mega neon effects if needed
+            if item.properties.neon then
+                local itemData = items[item.kind]
+                if itemData then
+                    neonify(petModel, itemData)
+                end
+            end
+            
+            if item.properties.mega_neon then
+                local itemData = items[item.kind]
+                if itemData then
+                    neonify(petModel, itemData)
+                end
+            end
+            
+            equippedPet = item
+            addPetWrapper(
+                {
+                    char = petModel,
+                    mega_neon = item.properties.mega_neon or false,
+                    neon = item.properties.neon or false,
+                    player = game.Players.LocalPlayer,
+                    entity_controller = game.Players.LocalPlayer,
+                    controller = game.Players.LocalPlayer,
+                    rp_name = item.properties.rp_name or "",
+                    pet_trick_level = item.properties.pet_trick_level or 0,
+                    pet_unique = item.unique,
+                    pet_id = item.id,
+                    location = {
+                        full_destination_id = "housing",
+                        destination_id = "housing",
+                        house_owner = game.Players.LocalPlayer
+                    },
+                    pet_progression = {
+                        friendship_level = item.properties.friendship_level or 0,
+                        age = item.properties.age or 1,
+                        percentage = 0
+                    },
+                    are_colors_sealed = false,
+                    is_pet = true
+                }
+            )
+            addPetState(
+                {
+                    char = petModel,
+                    player = game.Players.LocalPlayer,
+                    store_key = "pet_state_managers",
+                    is_sitting = false,
+                    chars_connected_to_me = {},
+                    states = {}
+                }
+            )
+        end
+
+        -- Mock remote functions
+        local oldGet = router.get
+        local function createRemoteFunctionMock(callback)
+            return {
+                InvokeServer = function(_, ...)
+                    return callback(...)
+                end
+            }
+        end
+        local function createRemoteEventMock(callback)
+            return {
+                FireServer = function(_, ...)
+                    return callback(...)
+                end
+            }
+        end
+
+        -- Create mock remotes for pet functionality
+        local equipRemote =
+            createRemoteFunctionMock(
+            function(uniqueId, metadata)
+                local pet = pets[uniqueId]
+                if not pet then
+                    return
+                end
+                equip(pet.data)
+                return true, {action = "equip", is_server = true}
+            end
+        )
+        local unequipRemote =
+            createRemoteFunctionMock(
+            function(uniqueId)
+                local pet = pets[uniqueId]
+                if not pet then
+                    return
+                end
+                unequip(pet.data)
+                return true, {action = "unequip", is_server = true}
+            end
+        )
+        local rideRemote =
+            createRemoteFunctionMock(
+            function(item)
+                ride(item.pet_unique)
+            end
+        )
+        local flyRemote =
+            createRemoteFunctionMock(
+            function(item)
+                fly(item.pet_unique)
+            end
+        )
+        local unmountRemoteFunction =
+            createRemoteFunctionMock(
+            function()
+                unmount(mountedPet)
+            end
+        )
+        local unmountRemoteEvent =
+            createRemoteEventMock(
+            function()
+                unmount(mountedPet)
+            end
+        )
+
+        -- Override router to use mock remotes
+        router.get = function(name)
+            if name == "ToolAPI/Equip" then
+                return equipRemote
+            end
+            if name == "ToolAPI/Unequip" then
+                return unequipRemote
+            end
+            if name == "AdoptAPI/RidePet" then
+                return rideRemote
+            end
+            if name == "AdoptAPI/FlyPet" then
+                return flyRemote
+            end
+            if name == "AdoptAPI/ExitSeatStatesYield" then
+                return unmountRemoteFunction
+            end
+            if name == "AdoptAPI/ExitSeatStates" then
+                return unmountRemoteEvent
+            end
+            return oldGet(name)
+        end
+
+        -- Unequip any existing pets
+        for _, charWrapper in pairs(clientData.get("pet_char_wrappers")) do
+            oldGet("ToolAPI/Unequip"):InvokeServer(charWrapper.pet_unique)
+        end
+
+        -- Load inventory database for pet name lookup
+        local Loads = require(game.ReplicatedStorage.Fsys).load
+        local InventoryDB = Loads("InventoryDB")
+
+        -- Function to get pet ID by name
+        function GetPetByName(name)
+            for i, v in pairs(InventoryDB.pets) do
+                if v.name:lower() == name:lower() then
+                    return v.id
+                end
+            end
+            return false
+        end
+
+        -- FIXED: Simple spawn function with correct property handling
+        function SpawnPet(petName, petType)
+            if not petName or petName == "" then
+                return false, "Please enter a pet name!"
+            end
+            
+            local petId = GetPetByName(petName)
+            if not petId then
+                return false, "Pet not found!"
+            end
+            
+            -- Base properties for all pets
+            local properties = {
+                pet_trick_level = 0,
+                rideable = true,
+                flyable = true,
+                friendship_level = 0,
+                age = 1,
+                ailments_completed = 0,
+                rp_name = ""
+            }
+            
+            -- CORRECTED: Set the correct properties for each pet type
+            if petType == "FR" then
+                -- Regular pet, no special properties needed
+            elseif petType == "NFR" then
+                properties.neon = true
+                properties.neon_color = Color3.new(1, 1, 1) -- White neon
+                properties.rideable = true
+                properties.flyable = true
+            elseif petType == "MFR" then
+                properties.mega_neon = true
+                properties.neon = true -- Mega neon pets are also neon
+                properties.neon_color = Color3.new(1, 0, 1) -- Purple for mega neon
+                properties.rideable = true
+                properties.flyable = true
+            end
+            
+            print("Spawning pet with properties:", properties)
+            
+            local pet = createPet(petId, properties)
+            
+            -- Auto-equip the pet
+            task.wait(0.5)
+            if pet then
+                equip(pet)
+                return true, "Successfully spawned " .. petName .. " (" .. petType .. ")"
+            else
+                return false, "Failed to create pet!"
+            end
+        end
+
+        -- ======================
+        -- RAYFIELD UI - UPDATED
+        -- ======================
+        
+        print("Loading RayField UI...")
+        
+        -- Load RayField
+        local Rayfield
+        local rayfieldSuccess, rayfieldError = pcall(function()
+            Rayfield = loadstring(game:HttpGet('https://raw.githubusercontent.com/shlexware/Rayfield/main/source'))()
+        end)
+        
+        if not rayfieldSuccess then
+            print("Trying alternative RayField URL...")
+            rayfieldSuccess, rayfieldError = pcall(function()
+                Rayfield = loadstring(game:HttpGet('https://sirius.menu/rayfield'))()
+            end)
+        end
+        
+        if not rayfieldSuccess then
+            warn("Failed to load RayField:", rayfieldError)
+            return
+        end
+        
+        print("RayField loaded successfully, creating window...")
+
+        -- Create Window
+        local Window = Rayfield:CreateWindow({
+            Name = "Pet Spawner",
+            LoadingTitle = "Pet Spawner",
+            LoadingSubtitle = "Loading...",
+            ConfigurationSaving = {
+               Enabled = false,
+            },
+            KeySystem = false,
+        })
+
+        -- Create Main Tab
+        local MainTab = Window:CreateTab("Main")
+        
+        MainTab:CreateSection("Pet Spawner")
+        
+        -- Pet Name Input
+        local petNameInput = MainTab:CreateInput({
+            Name = "Pet Name",
+            PlaceholderText = "Enter pet name (e.g. Dragon)",
+            RemoveTextAfterFocusLost = false,
+            Callback = function(Text)
+                _G.SelectedPetName = Text
+            end,
+        })
+
+        -- Pet Type Dropdown
+        MainTab:CreateDropdown({
+            Name = "Pet Type",
+            Options = {"FR", "NFR", "MFR"},
+            CurrentOption = "FR",
+            MultipleOptions = false,
+            Callback = function(Option)
+                _G.SelectedPetType = Option
+            end,
+        })
+
+        -- Spawn Button
+        MainTab:CreateButton({
+            Name = "Spawn Pet",
+            Callback = function()
+                local petName = _G.SelectedPetName or ""
+                local petType = _G.SelectedPetType or "FR"
+                
+                if petName == "" then
+                    Rayfield:Notify({
+                        Title = "Error",
+                        Content = "Please enter a pet name first!",
+                        Duration = 3,
+                    })
+                    return
+                end
+                
+                print("Attempting to spawn:", petName, "Type:", petType)
+                
+                local success, message = SpawnPet(petName, petType)
+                
+                if success then
+                    Rayfield:Notify({
+                        Title = "Success",
+                        Content = message,
+                        Duration = 5,
+                    })
+                else
+                    Rayfield:Notify({
+                        Title = "Error",
+                        Content = message,
+                        Duration = 5,
+                    })
+                end
+            end,
+        })
+
+        -- Create Pet Settings Tab (renamed from Management)
+        local PetSettingsTab = Window:CreateTab("Pet Settings")
+
+        PetSettingsTab:CreateSection("Pet Controls")
+        
+        -- Ride Button
+        PetSettingsTab:CreateButton({
+            Name = "Ride Pet",
+            Callback = function()
+                if equippedPet then
+                    ride(equippedPet.unique)
+                    Rayfield:Notify({
+                        Title = "Success",
+                        Content = "Now riding your pet!",
+                        Duration = 3,
+                    })
+                else
+                    Rayfield:Notify({
+                        Title = "Error",
+                        Content = "No pet equipped!",
+                        Duration = 3,
+                    })
+                end
+            end,
+        })
+
+        -- Fly Button
+        PetSettingsTab:CreateButton({
+            Name = "Fly Pet",
+            Callback = function()
+                if equippedPet then
+                    fly(equippedPet.unique)
+                    Rayfield:Notify({
+                        Title = "Success",
+                        Content = "Now flying on your pet!",
+                        Duration = 3,
+                    })
+                else
+                    Rayfield:Notify({
+                        Title = "Error",
+                        Content = "No pet equipped!",
+                        Duration = 3,
+                    })
+                end
+            end,
+        })
+
+        -- Unmount Button
+        PetSettingsTab:CreateButton({
+            Name = "Unmount Pet",
+            Callback = function()
+                if mountedPet then
+                    unmount(mountedPet)
+                    Rayfield:Notify({
+                        Title = "Success",
+                        Content = "Stopped riding/flying!",
+                        Duration = 3,
+                    })
+                else
+                    Rayfield:Notify({
+                        Title = "Error",
+                        Content = "Not mounted on any pet!",
+                        Duration = 3,
+                    })
+                end
+            end,
+        })
+
+        -- Unequip Button
+        PetSettingsTab:CreateButton({
+            Name = "Unequip Pet",
+            Callback = function()
+                if equippedPet then
+                    unequip(equippedPet)
+                    Rayfield:Notify({
+                        Title = "Success",
+                        Content = "Pet unequipped!",
+                        Duration = 3,
+                    })
+                else
+                    Rayfield:Notify({
+                        Title = "Error",
+                        Content = "No pet equipped!",
+                        Duration = 3,
+                    })
+                end
+            end,
+        })
+
+        -- Settings Tab
+        local SettingsTab = Window:CreateTab("Settings")
+
+        SettingsTab:CreateSection("UI Settings")
+        
+        SettingsTab:CreateButton({
+            Name = "Destroy UI",
+            Callback = function()
+                Rayfield:Destroy()
+            end,
+        })
+
+        SettingsTab:CreateSection("Information")
+        
+        SettingsTab:CreateLabel("Pet Spawner v1.0")
+        SettingsTab:CreateLabel("Game: Adopt Me")
+
+        print("Pet Spawner UI loaded successfully!")
+        Rayfield:Notify({
+            Title = "Pet Spawner",
+            Content = "UI loaded successfully!",
+            Duration = 5,
+        })
+    end
+)
